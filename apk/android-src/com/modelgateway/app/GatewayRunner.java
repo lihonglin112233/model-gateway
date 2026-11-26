@@ -33,9 +33,6 @@ final class GatewayRunner {
 
     private static final String ROOTFS = "rootfs";
     private static final String APP = "app";
-    /** 仅作为低版本系统回退时从 assets 取 proot 的副本名。 */
-    private static final String PROOT = "proot";
-    private static final String PROOT_LOADER = "proot-loader";
 
     private final Context ctx;
     private final Callback cb;
@@ -116,10 +113,6 @@ final class GatewayRunner {
             try {
                 new FileOutputStream(stamp).close();
             } catch (Throwable ignore) { }
-            try {
-                copyAsset(PROOT, new File(runtime, PROOT), true);
-                copyAsset(PROOT_LOADER, new File(runtime, PROOT_LOADER), true);
-            } catch (Throwable ignore) { }
             log("运行时就绪");
         } else {
             log("运行时已存在，跳过解压");
@@ -173,13 +166,15 @@ final class GatewayRunner {
      * 所以 proot 必须以 libproot.so 的形式随 APK 安装，而不是放 assets。
      */
     private File prootBinary() {
+        return new File(ctx.getApplicationInfo().nativeLibraryDir, "libproot.so");
+    }
+
+    /** proot 的 loader 组件，同样随 APK 安装到 nativeLibraryDir。 */
+    private File prootLoader() {
         String dir = ctx.getApplicationInfo().nativeLibraryDir;
-        File p = new File(dir, "libproot.so");
+        File p = new File(dir, "libproot-loader.so");
         if (p.isFile()) return p;
-        // 极少数 ROM 不按 .so 解压，退回 assets 里的副本（低版本系统可用）
-        File fallback = new File(runtimeDir(), PROOT);
-        if (fallback.isFile()) return fallback;
-        return p;
+        return new File(dir, "libproot.so");
     }
 
     // ---------------- 启动 ----------------
@@ -203,8 +198,6 @@ final class GatewayRunner {
         cmd.add("--rootfs=" + rootfs.getAbsolutePath());
         cmd.add("--cwd=/root/app");
         cmd.add("-b");
-        cmd.add(proot.getAbsolutePath() + ":/opt/proot");
-        cmd.add("-b");
         cmd.add("/dev");
         cmd.add("-b");
         cmd.add("/proc");
@@ -218,22 +211,8 @@ final class GatewayRunner {
         cmd.add("/storage/emulated/0:/sdcard");
         cmd.add("-b");
         cmd.add(new File(rootfs, "dev/shm").getAbsolutePath() + ":/dev/shm");
-        cmd.add("/usr/bin/env");
-        cmd.add("-i");
-        cmd.add("HOME=/root");
-        cmd.add("USER=root");
-        cmd.add("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
-        cmd.add("LANG=C.UTF-8");
-        cmd.add("TMPDIR=/tmp");
-        cmd.add("PYTHONPATH=/root/app");
-        cmd.add("PYTHONHOME=/usr");
-        cmd.add("PYTHONUNBUFFERED=1");
-        cmd.add("GATEWAY_HOST=127.0.0.1");
-        cmd.add("GATEWAY_PORT=" + port);
-        cmd.add("GATEWAY_DATA_DIR=/root/app/data");
-        cmd.add("GATEWAY_UPSTREAM=mock");
-        if (adminToken.length() > 0) cmd.add("GATEWAY_ADMIN_TOKEN=" + adminToken);
-        if (apiKey.length() > 0) cmd.add("GATEWAY_API_KEY=" + apiKey);
+        // 环境变量用进程环境传，不再插一个 /usr/bin/env -i：
+        // env 是 busybox 的符号链接，多一层外部可执行就多一个失败点。
         cmd.add("/usr/bin/python3");
         cmd.add("-m");
         cmd.add("uvicorn");
@@ -245,6 +224,22 @@ final class GatewayRunner {
 
         ProcessBuilder pb = new ProcessBuilder(cmd);
         pb.redirectErrorStream(true);
+
+        java.util.Map<String, String> env = pb.environment();
+        env.clear();
+        env.put("HOME", "/root");
+        env.put("USER", "root");
+        env.put("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+        env.put("LANG", "C.UTF-8");
+        env.put("TMPDIR", "/tmp");
+        env.put("PYTHONPATH", "/root/app");
+        env.put("PYTHONUNBUFFERED", "1");
+        env.put("GATEWAY_HOST", "127.0.0.1");
+        env.put("GATEWAY_PORT", String.valueOf(port));
+        env.put("GATEWAY_DATA_DIR", "/root/app/data");
+        env.put("GATEWAY_UPSTREAM", "mock");
+        if (adminToken.length() > 0) env.put("GATEWAY_ADMIN_TOKEN", adminToken);
+        if (apiKey.length() > 0) env.put("GATEWAY_API_KEY", apiKey);
         // proot 需要能找到自己依赖的 libtalloc 等（rootfs 内的库在 guest 生效，
         // 宿主机侧这些 .so 已在 rootfs/lib 里，用 LD_LIBRARY_PATH 指过去）
         // proot 自己依赖 libtalloc / libandroid-shmem，它们在 nativeLibraryDir；
@@ -257,12 +252,12 @@ final class GatewayRunner {
         // proot 的 --link2symlink 依赖一个独立的 loader 可执行文件，
         // 默认路径编死在 Termux 目录下，必须显式指过去，否则 guest 里
         // 所有符号链接都会失败（rootfs 里有 567 个）。
-        File loader = new File(runtime, PROOT_LOADER);
+        File loader = prootLoader();
         if (loader.isFile()) {
             loader.setExecutable(true, false);
             pb.environment().put("PROOT_LOADER", loader.getAbsolutePath());
         } else {
-            log("警告：缺少 proot-loader，符号链接可能失效");
+            log("警告：缺少 proot loader，符号链接可能失效");
         }
 
         cb.onState("启动中…");

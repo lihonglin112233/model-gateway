@@ -83,7 +83,10 @@ final class TarGz {
                         File parent = out.getParentFile();
                         if (parent != null) parent.mkdirs();
                         deleteQuietly(out);
-                        symlink(link, out);
+                        // 绝对链接（/bin/busybox）在 Android 上会指向手机根目录，
+                        // 而不是解压出来的 rootfs，必须转成相对路径，
+                        // 否则 /usr/bin/env 这类链接全是坏链，proot 直接跑不起来。
+                        symlink(relativize(name, link), out);
                         break;
                     }
                     case '1': {
@@ -179,6 +182,50 @@ final class TarGz {
      * 都靠可执行位才能跑。Java 的 File API 只能表达"属主可执行"，
      * 对 Android 上以应用身份运行自己的文件来说够用。
      */
+    /**
+     * 把 tar 里的绝对符号链接改成相对链接。
+     *
+     * rootfs 里有 426 个绝对链接（绝大多数指向 /bin/busybox 与 /usr/share/…），
+     * 在 Linux 上没问题，但在 Android 上 "/bin/busybox" 解析的是手机系统的
+     * /bin，而非我们解压出来的 rootfs —— 结果就是所有 applet 全部失效。
+     * 这里按「链接所在目录」相对算出目标，语义等价且不依赖 guest 的绝对路径。
+     */
+    private static String relativize(String linkPath, String target) {
+        if (target == null || target.length() == 0) return target;
+        if (!target.startsWith("/")) return target;   // 已经是相对链接
+
+        // 链接自身所在目录（去掉文件名）
+        int slash = linkPath.lastIndexOf('/');
+        String fromDir = slash >= 0 ? linkPath.substring(0, slash) : "";
+        String to = target.substring(1);              // 去掉前导 /
+
+        // 拆分路径段
+        java.util.List<String> from = segments(fromDir);
+        java.util.List<String> dest = segments(to);
+        int common = 0;
+        while (common < from.size() && common < dest.size()
+                && from.get(common).equals(dest.get(common))) {
+            common++;
+        }
+        StringBuilder sb = new StringBuilder();
+        for (int i = common; i < from.size(); i++) sb.append("../");
+        for (int i = common; i < dest.size(); i++) {
+            sb.append(dest.get(i));
+            if (i < dest.size() - 1) sb.append('/');
+        }
+        String rel = sb.toString();
+        return rel.length() == 0 ? "." : rel;
+    }
+
+    private static java.util.List<String> segments(String p) {
+        java.util.List<String> out = new java.util.ArrayList<String>();
+        if (p == null || p.length() == 0) return out;
+        for (String part : p.split("/")) {
+            if (part.length() > 0 && !".".equals(part)) out.add(part);
+        }
+        return out;
+    }
+
     private static void applyMode(File f, int mode) {
         if (mode <= 0) return;
         try {

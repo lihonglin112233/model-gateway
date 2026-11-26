@@ -268,6 +268,18 @@ public class MainActivity extends Activity {
     }
 
     private void openAdmin() {
+        if (prefs().getString(KEY_ADMIN_TOKEN, "").trim().length() == 0) {
+            // 后端在没配 GATEWAY_ADMIN_TOKEN 时会让后台整站 503（fail-safe），
+            // 直接打开只会看到一片空白，不如在这里说清楚该填什么。
+            new AlertDialog.Builder(this)
+                    .setTitle("先设置后台口令")
+                    .setMessage("网关要求先设一个后台登录口令，否则 /admin 会返回 503。\n\n"
+                            + "点「设置口令」填任意强口令 → 点「停止」→ 点「启动」，然后再打开后台。")
+                    .setPositiveButton("去设置", (d, w) -> editSetting(KEY_ADMIN_TOKEN, "后台登录口令", true))
+                    .setNegativeButton("取消", null)
+                    .show();
+            return;
+        }
         Intent i = new Intent(this, AdminWebActivity.class);
         i.putExtra("url", baseUrl(port()) + "/admin");
         startActivity(i);

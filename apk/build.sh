@@ -26,15 +26,15 @@ echo "== 2/6 打包 rootfs（剔除项目代码，避免与 app.tar.gz 重复）
 rm -rf "$ROOTFS/root/app"
 ( cd "$ROOTFS" && tar -cf - . ) | gzip -9 > $OUT/assets/rootfs.tar.gz
 
-echo "== 3/6 复制 proot 运行时"
-cp /root/work/apk/dsh/lib/arm64-v8a/libproot.so        $OUT/assets/proot
-cp /root/work/apk/dsh/lib/arm64-v8a/libproot-loader.so $OUT/assets/proot-loader
-cp /root/work/apk/dsh/lib/arm64-v8a/libtalloc.so       $OUT/assets/libtalloc.so
-cp /root/work/apk/dsh/lib/arm64-v8a/libandroid-shmem.so $OUT/assets/libandroid-shmem.so
+echo "== 3/6 复制 proot 运行时（全部放 lib/，与 DSH 同布局）"
+# 关键：proot 与 loader 都以 native lib 形式随 APK 安装，
+# 系统会把它们解压到 nativeLibraryDir 并带可执行位。
+# 不往 assets/ 里放任何裸可执行文件——那既违反 Android 10+ 的 W^X，
+# 也容易被 MIUI 安装器的安全扫描判为可疑。
 mkdir -p $OUT/lib/arm64-v8a
-cp /root/work/apk/dsh/lib/arm64-v8a/libproot.so         $OUT/lib/arm64-v8a/
-cp /root/work/apk/dsh/lib/arm64-v8a/libtalloc.so        $OUT/lib/arm64-v8a/
-cp /root/work/apk/dsh/lib/arm64-v8a/libandroid-shmem.so $OUT/lib/arm64-v8a/
+for f in libproot.so libproot-loader.so libtalloc.so libandroid-shmem.so; do
+  cp /root/work/apk/dsh/lib/arm64-v8a/$f $OUT/lib/arm64-v8a/
+done
 
 echo "== 4/6 编译 Java"
 javac -source 8 -target 8 -encoding UTF-8 -bootclasspath "$AJ" \
@@ -44,15 +44,21 @@ javac -source 8 -target 8 -encoding UTF-8 -bootclasspath "$AJ" \
 echo "== 5/6 资源与打包"
 $AAPT2 compile --dir res -o $OUT/res.zip
 $AAPT2 link -o $OUT/unsigned.apk -I "$AJ" --manifest AndroidManifest.xml \
-  $OUT/res.zip --min-sdk-version 24 --target-sdk-version 34 -A $OUT/assets
+  $OUT/res.zip --min-sdk-version 26 --target-sdk-version 34 -A $OUT/assets
+# resources.arsc 必须未压缩（targetSdk 30+ 的硬要求，否则安装报 -124）
+# 原生库也保持未压缩，便于系统直接 mmap / 校验
 ( cd $OUT/apkdir && unzip -q ../unsigned.apk && cp ../dex/classes.dex . \
   && mkdir -p lib/arm64-v8a && cp ../lib/arm64-v8a/*.so lib/arm64-v8a/ \
-  && zip -q -r -X ../stage.apk . -x 'META-INF/*' )
+  && rm -f ../stage.apk \
+  && zip -q -X -0 ../stage.apk resources.arsc \
+  && zip -q -X -0 ../stage.apk lib/arm64-v8a/*.so \
+  && zip -q -r -X ../stage.apk . -x 'META-INF/*' -x 'resources.arsc' -x 'lib/*' )
 zipalign -f -p 4 $OUT/stage.apk $OUT/aligned.apk
+zipalign -c -p 4 $OUT/aligned.apk >/dev/null && echo "对齐校验通过"
 
 echo "== 6/6 签名"
 apksigner sign --ks build/mg.jks --ks-pass pass:mgpass123 --key-pass pass:mgpass123 \
-  --ks-key-alias mg --min-sdk-version 24 --v1-signing-enabled true \
+  --ks-key-alias mg --min-sdk-version 26 --v1-signing-enabled true \
   --v2-signing-enabled true --v3-signing-enabled true \
   --out $OUT/ModelGateway.apk $OUT/aligned.apk
 apksigner verify --print-certs $OUT/ModelGateway.apk | head -3

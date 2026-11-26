@@ -1,0 +1,8 @@
+.env
+data/*.db
+data/*.db-journal
+credentials/
+__pycache__/
+*.pyc
+apk/build/
+apk/.gradle/

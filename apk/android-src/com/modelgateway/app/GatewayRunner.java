@@ -34,6 +34,12 @@ final class GatewayRunner {
     private static final String ROOTFS = "rootfs";
     private static final String APP = "app";
 
+    /**
+     * 运行时布局版本。凡改动解包逻辑（权限还原、符号链接处理）、
+     * rootfs 内容或 proot 启动参数，都要把它改一下，强制用户端重解。
+     */
+    private static final String RUNTIME_VERSION = "4";
+
     private final Context ctx;
     private final Callback cb;
     private final AtomicBoolean running = new AtomicBoolean(false);
@@ -93,25 +99,80 @@ final class GatewayRunner {
 
     // ---------------- 准备运行时 ----------------
 
+    private static String readStamp(File stamp) {
+        try {
+            if (!stamp.isFile()) return "";
+            java.io.FileInputStream in = new java.io.FileInputStream(stamp);
+            try {
+                byte[] buf = new byte[64];
+                int n = in.read(buf);
+                return n > 0 ? new String(buf, 0, n, "UTF-8").trim() : "";
+            } finally {
+                in.close();
+            }
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
     private void prepare() throws Exception {
         File runtime = runtimeDir();
         File rootfs = rootfsDir();
         File stamp = new File(runtime, ".ready");
 
-        if (!stamp.isFile() || !rootfs.isDirectory()) {
+        // 标记文件里存运行时版本；APK 升级但 data 目录保留时，
+        // 只判断“文件存在”会导致继续用旧版本解压出来的残缺 rootfs
+        // （旧版本没还原权限、也没修正符号链接）。版本不符必须重解。
+        if (!stamp.isFile() || !rootfs.isDirectory() || !RUNTIME_VERSION.equals(readStamp(stamp))) {
             cb.onState("解压运行时（首次约需 1 分钟）");
+            // 先把用户数据（SQLite、凭据）挪出来，重解压后再放回，
+            // 否则升级一次就丢账号和用量记录。
+            File backup = new File(runtimeDir().getParentFile(), "data-backup");
+            // 正常位置：<rootfs>/root/app/data
+            File oldData = new File(new File(rootfs, "root"), "app/data");
+            // 旧版本把 rootfs 解到了 runtime 本身，数据会落在这里；
+            // 升级时一并搬过去，别让用户重配账号。
+            File legacyData = new File(new File(runtime, "root"), "app/data");
+            if (!oldData.isDirectory() && legacyData.isDirectory()) {
+                oldData = legacyData;
+                log("发现旧版本数据，准备迁移");
+            }
+            boolean hadData = oldData.isDirectory();
+            if (hadData) {
+                deleteTree(backup);
+                if (!oldData.renameTo(backup)) {
+                    // 改名失败（跨挂载点等）就复制
+                    copyTree(oldData, backup);
+                }
+            }
+
             deleteTree(runtime);
             if (!runtime.mkdirs() && !runtime.isDirectory()) {
                 throw new IOException("无法创建 " + runtime);
             }
             log("解压 rootfs…");
-            extract("rootfs.tar.gz", runtime);
+            extract("rootfs.tar.gz", rootfs);
             log("解压应用…");
             extract("app.tar.gz", new File(rootfs, "root"));
+
+            if (hadData && backup.isDirectory()) {
+                File newData = new File(new File(rootfs, "root"), "app/data");
+                deleteTree(newData);
+                File parent = newData.getParentFile();
+                if (parent != null) parent.mkdirs();
+                if (!backup.renameTo(newData)) copyTree(backup, newData);
+                deleteTree(backup);
+                log("已恢复原有数据");
+            }
             // proot 首选 nativeLibraryDir（安装时由系统解压，可执行）。
             // 同时保留一份 assets 副本，供极少数不解压 .so 的旧系统回退。
             try {
-                new FileOutputStream(stamp).close();
+                FileOutputStream fo = new FileOutputStream(stamp);
+                try {
+                    fo.write(RUNTIME_VERSION.getBytes("UTF-8"));
+                } finally {
+                    fo.close();
+                }
             } catch (Throwable ignore) { }
             log("运行时就绪");
         } else {
@@ -213,7 +274,16 @@ final class GatewayRunner {
         cmd.add(new File(rootfs, "dev/shm").getAbsolutePath() + ":/dev/shm");
         // 环境变量用进程环境传，不再插一个 /usr/bin/env -i：
         // env 是 busybox 的符号链接，多一层外部可执行就多一个失败点。
-        cmd.add("/usr/bin/python3");
+        // 优先 python3；万一该符号链接在某种解压下失效，退回解释器真身。
+        // 这一步在宿主侧判断，不依赖 proot 起来之后再发现。
+        String python = "/usr/bin/python3";
+        File py3 = new File(rootfs, "usr/bin/python3");
+        File pyReal = new File(rootfs, "usr/bin/python3.12");
+        if (!py3.exists() && pyReal.exists()) {
+            python = "/usr/bin/python3.12";
+            log("注意：python3 链接缺失，改用 python3.12");
+        }
+        cmd.add(python);
         cmd.add("-m");
         cmd.add("uvicorn");
         cmd.add("gateway.app:app");
@@ -337,6 +407,30 @@ final class GatewayRunner {
 
     private void log(String s) {
         cb.onLog(s);
+    }
+
+    private static void copyTree(File src, File dst) {
+        if (src.isDirectory()) {
+            if (!dst.isDirectory() && !dst.mkdirs()) return;
+            File[] kids = src.listFiles();
+            if (kids != null) {
+                for (File k : kids) copyTree(k, new File(dst, k.getName()));
+            }
+            return;
+        }
+        java.io.FileInputStream in = null;
+        FileOutputStream out = null;
+        try {
+            in = new java.io.FileInputStream(src);
+            out = new FileOutputStream(dst);
+            byte[] buf = new byte[65536];
+            int n;
+            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+        } catch (Throwable ignore) {
+        } finally {
+            try { if (in != null) in.close(); } catch (Throwable ignore) { }
+            try { if (out != null) out.close(); } catch (Throwable ignore) { }
+        }
     }
 
     private static void deleteTree(File f) {
